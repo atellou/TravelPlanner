@@ -1,36 +1,29 @@
-import os
-import getpass
-from typing import TypedDict, Annotated, List
-import langchain
+from typing import TypedDict, List
 
 from langchain_google_vertexai import ChatVertexAI
 from langchain_google_vertexai import VertexAIEmbeddings
 from langchain_core.vectorstores import InMemoryVectorStore
 
-from travelplanner.prompt import (
+from langchain_core.messages import (
+    SystemMessage,
+    HumanMessage,
+)
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import StateGraph, END
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolNode
+from langchain_core.messages import SystemMessage
+
+from pydantic import BaseModel
+from IPython.display import Image, display
+
+from prompt import (
     QUESTION_PLANNER_INSTRUCTION,
     RESEARCHER_PLAN_INSTRUCTION,
     REACT_REFLECT_PLANNER_INSTRUCTION,
     REFLECT_INSTRUCTION,
     RESEARCH_CRITIQUE_PROMPT,
 )
-
-from langchain_core.messages import (
-    AnyMessage,
-    SystemMessage,
-    HumanMessage,
-    AIMessage,
-    ChatMessage,
-)
-from langgraph.graph import MessagesState, StateGraph, END
-from langchain_core.tools import tool
-from langgraph.prebuilt import ToolNode
-from langchain_core.messages import SystemMessage
-from langchain_core.pydantic_v1 import BaseModel
-
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-if not os.environ.get("LANGCHAIN_API_KEY"):
-    os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
 
 
 class Queries(BaseModel):
@@ -41,12 +34,10 @@ class AgentState(TypedDict):
     task: str
     travel_questions: str
     plan_information: str
-    draft: str
     revision_number: int
     max_revisions: int
     plan: str
     critique: str
-    content: List[str]
 
 
 class AgentPlanner:
@@ -55,31 +46,47 @@ class AgentPlanner:
     ):
         self.model_name = model_name
         self.embedding_model = embedding_model
-        llm = ChatVertexAI(model=model_name)
+        llm = ChatVertexAI(
+            model=model_name,
+        )
         embeddings = VertexAIEmbeddings(model=embedding_model)
         vector_store = InMemoryVectorStore(embeddings)
 
         self.llm = llm
         self.vector_store = vector_store
         self.retriever = self.vector_store.as_retriever()
-
+        self.tools = ToolNode([self.retrieve])
         self.llm_tools = self.llm.bind_tools([self.retrieve])
+        self.define_graph()
 
-        self.reflect_prompt = langchain.prompts.PromptTemplate(
-            input_variables=["text", "query", "scratchpad"],
-            template=REFLECT_INSTRUCTION,
+    def define_graph(self):
+        # Nodes
+        builder = self.graph_builder = StateGraph(AgentState)
+        builder.add_node("question", self.question_node)
+        builder.add_node("research", self.researcher_planner_node)
+        builder.add_node("generate", self.generation_node)
+        builder.add_node("reflect", self.reflection_node)
+        builder.add_node("research_critique", self.research_critique_node)
+        #
+        builder.set_entry_point("question")
+        # Edges
+        builder.add_edge("question", "research")
+        builder.add_edge("research", "generate")
+        builder.add_conditional_edges(
+            "generate", self.should_continue, {END: END, "reflect": "reflect"}
         )
+        builder.add_edge("reflect", "research_critique")
+        self.memory = SqliteSaver.from_conn_string(":memory:")
+        self.graph = builder.compile(checkpointer=self.memory)
 
-        self.agent_prompt = langchain.prompts.PromptTemplate(
-            input_variables=["text", "query", "reflections", "scratchpad"],
-            template=REACT_REFLECT_PLANNER_INSTRUCTION,
-        )
+    def load_reference_information(self, chunks):
+        """Load reference information into the vector store."""
+        self.vector_store.add_documents(documents=chunks)
 
-        self.graph_builder = StateGraph(MessagesState)
+    def display_graph(self):
+        Image(self.graph.get_graph().draw_png())
 
-        tools = ToolNode([self.retrieve])
-
-    def question_planner_node(self, state: AgentState):
+    def question_node(self, state: AgentState):
         messages = [
             SystemMessage(content=QUESTION_PLANNER_INSTRUCTION),
             HumanMessage(content=state["task"]),
@@ -102,19 +109,21 @@ class AgentPlanner:
         return {"plan_information": response.content}
 
     def generation_node(self, state: AgentState):
-        content = "\n\n".join(state["content"] or [])
         user_message = HumanMessage(
             content=f"{state['task']}\n\nHere is some possible usefull information:\n\n{state['plan_information']}"
         )
         messages = [
             SystemMessage(
-                content=REACT_REFLECT_PLANNER_INSTRUCTION.format(content=content)
+                content=REACT_REFLECT_PLANNER_INSTRUCTION.format(
+                    reflections=state.get("critique", ""),
+                    content=state.get("plan_information", ""),
+                )
             ),
             user_message,
         ]
         response = self.llm.invoke(messages)
         return {
-            "draft": response.content,
+            "plan": response.content,
             "revision_number": state.get("revision_number", 1) + 1,
         }
 
@@ -122,7 +131,7 @@ class AgentPlanner:
         messages = [
             SystemMessage(content=REFLECT_INSTRUCTION),
             HumanMessage(
-                content=f"{state['draft']}\n\nHere is some possible usefull information:\n\n{state['plan_information']}"
+                content=f"{state['plan']}\n\nHere is some possible usefull information:\n\n{state['plan_information']}"
             ),
         ]
         response = self.llm.invoke(messages)
@@ -159,48 +168,3 @@ class AgentPlanner:
             for doc in retrieved_docs
         )
         return serialized, retrieved_docs
-
-    def query_or_respond(self, state: MessagesState):
-        """Generate tool call for retrieval or respond."""
-        llm_with_tools = self.llm.bind_tools([self.retrieve])
-        response = llm_with_tools.invoke(state["messages"])
-        # MessagesState appends messages to state instead of overwriting
-        return {"messages": [response]}
-
-    def generate(self, state: MessagesState):
-        """Generate answer."""
-        # Get generated ToolMessages
-        recent_tool_messages = []
-        for message in reversed(state["messages"]):
-            if message.type == "tool":
-                recent_tool_messages.append(message)
-            else:
-                break
-        tool_messages = recent_tool_messages[::-1]
-
-        # Format into prompt
-        docs_content = "\n\n".join(doc.content for doc in tool_messages)
-        system_message_content = (
-            "You are an assistant for question-answering tasks. "
-            "Use the following pieces of retrieved context to answer "
-            "the question. If you don't know the answer, say that you "
-            "don't know. Use three sentences maximum and keep the "
-            "answer concise."
-            "\n\n"
-            f"{docs_content}"
-        )
-        conversation_messages = [
-            message
-            for message in state["messages"]
-            if message.type in ("human", "system")
-            or (message.type == "ai" and not message.tool_calls)
-        ]
-        prompt = [SystemMessage(system_message_content)] + conversation_messages
-
-        # Run
-        response = llm.invoke(prompt)
-        return {"messages": [response]}
-
-    def run(self, query):
-        docs = self.retriever.get_relevant_documents(query)
-        return docs

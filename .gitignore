@@ -1,4 +1,4 @@
-
+*.env
 *.pyc
 *.ipynb
 utils/.DS_Store

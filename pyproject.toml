@@ -11,6 +11,10 @@ langchain-google-vertexai = "^2.0.9"
 langchain-core = "^0.3.24"
 langgraph = "^0.2.59"
 langchain = "^0.3.11"
+langgraph-checkpoint-sqlite = "^2.0.1"
+google-auth = "^2.37.0"
+requests = "^2.32.3"
+openai = "^1.57.4"
 
 
 [build-system]
