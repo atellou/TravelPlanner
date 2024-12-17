@@ -48,14 +48,26 @@ Dinner: Kylin Skybar, Charlotte
 Accommodation: -
 ***** Example Ends *****
 
+{plan}
+
 {reflections}
 
-You must use Finish to indict you have finished the task. And each action only calls one function once.
-{content} """
+{information}"""
 
 
 REFLECT_INSTRUCTION = """You are an expert travel planner tasked to perform a critique of a devised plan \
-and provide detailed recommendations on how to improve the designed travel plan."""
+and provide detailed recommendations on how to improve the designed travel plan.
+
+The plan provided:
+{plan}
+
+{information}
+"""
 
 RESEARCH_CRITIQUE_PROMPT = """You are a researcher charged with providing information that can \
-be used when making any requested revisions (as outlined below)."""
+be used when making any requested revisions (as outlined below).
+
+{information}
+
+{critique}
+"""

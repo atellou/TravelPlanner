@@ -38,11 +38,12 @@ class Queries(BaseModel):
 class AgentState(TypedDict):
     task: str
     travel_questions: str
-    content: str
     revision_number: int
     max_revisions: int
     plan: str
     critique: str
+    content: str
+    information: str
 
 
 class VectorStoreQuestion(BaseModel):
@@ -106,17 +107,7 @@ class VectorRetrieverTool(BaseTool):
             (f"Source: {doc.metadata}\n" f"Content: {doc.page_content}")
             for doc in retrieved_docs
         )
-        return serialized, retrieved_docs
-
-    # @tool(response_format="content_and_artifact")
-    # def retrieve(query: str):
-    #     """Retrieve information related to a query."""
-    #     retrieved_docs = self.vector_store.similarity_search(query, k=2)
-    #     serialized = "\n\n".join(
-    #         (f"Source: {doc.metadata}\n" f"Content: {doc.page_content}")
-    #         for doc in retrieved_docs
-    #     )
-    #     return serialized, retrieved_docs
+        return serialized
 
 
 class AgentPlanner:
@@ -124,6 +115,9 @@ class AgentPlanner:
         self.model_name = model_name
         self.llm = ChatVertexAI(
             model=model_name,
+            temperature=0,
+            verbose=True,
+            max_retries=1,
         )
         # NOTE: Temporal beahviour, the idea is to be flexible with the tools usage
         assert any(
@@ -169,32 +163,36 @@ class AgentPlanner:
         return {"travel_questions": response.queries}
 
     def researcher_planner_node(self, state: AgentState):
-
+        questions = "\n-".join(state["travel_questions"])
         response = self.llm_tools.invoke(
             [
                 SystemMessage(content=RESEARCHER_PLAN_INSTRUCTION),
                 HumanMessage(
-                    content=f"{state['task']}\n\nThese are some travel questions to"
-                    + f" take into account:\n\n{state['travel_questions']}\n\n"
+                    content=f"{state['task']}\nThese are some travel questions to"
+                    + f" take into account:\n{questions}"
                 ),
             ]
         )
-        content = state["content"] or "Complementary information:"
-        content += f"\n\n{response.content}"
-        return {"content": content}
+
+        content = "".join(state.get("information", [])) or "Complementary information:"
+        content += f"\n{response.content}"
+        return {"information": content}
 
     def generation_node(self, state: AgentState):
-        user_message = HumanMessage(
-            content=f"{state['task']}\n\nHere is some possible usefull information:\n\n{state['content']}"
+        plan = "Previously generated plan:\n{}".format(state.get("plan"))
+        reflections = "Reflection provided by expert:\n{}".format(state.get("critique"))
+        information = "Here is some possible usefull information:\n{}".format(
+            state["information"]
         )
         messages = [
             SystemMessage(
                 content=REACT_REFLECT_PLANNER_INSTRUCTION.format(
-                    reflections=state.get("critique", ""),
-                    content=state.get("content", ""),
+                    plan=plan if state.get("plan") else "",
+                    reflections=reflections if state.get("critique") else "",
+                    information=information if state.get("information") else "",
                 )
             ),
-            user_message,
+            HumanMessage(content=state["task"]),
         ]
         response = self.llm.invoke(messages)
         return {
@@ -204,10 +202,15 @@ class AgentPlanner:
 
     def reflection_node(self, state: AgentState):
         messages = [
-            SystemMessage(content=REFLECT_INSTRUCTION),
-            HumanMessage(
-                content=f"{state['plan']}\n\nHere is some possible usefull information:\n\n{state['content']}"
+            SystemMessage(
+                content=REFLECT_INSTRUCTION.format(
+                    plan=state["plan"],
+                    information="\nHere is some possible usefull information:\n{}".format(
+                        state["information"]
+                    ),
+                )
             ),
+            HumanMessage(content=state["task"]),
         ]
         response = self.llm.invoke(messages)
         return {"critique": response.content}
@@ -216,18 +219,22 @@ class AgentPlanner:
 
         response = self.llm_tools.invoke(
             [
-                SystemMessage(content=RESEARCH_CRITIQUE_PROMPT),
-                HumanMessage(
-                    content=f"{state['task']}"
-                    + f"n\nInformation obtained before:\n\n{state['content']}"
-                    + f"\n\n Critique provided by expert:\n\n{state['critique']}"
+                SystemMessage(
+                    content=RESEARCH_CRITIQUE_PROMPT.format(
+                        information="\nInformation obtained before:\n{}".format(
+                            state["information"]
+                        ),
+                        critique="\nCritique provided by expert:\n{}".format(
+                            state["critique"]
+                        ),
+                    )
                 ),
+                HumanMessage(content=f"{state['task']}"),
             ]
         )
-
-        content = state["content"] or "Complementary information:"
-        content += f"\n\n{response.content}"
-        return {"content": content}
+        content = "".join(state.get("information", [])) or "Complementary information:"
+        content += f"\n{response.content}"
+        return {"information": content}
 
     def should_continue(self, state):
         if state["revision_number"] > state["max_revisions"]:
