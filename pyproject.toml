@@ -19,6 +19,10 @@ pygraphviz = "^1.14"
 datasets = "^3.2.0"
 
 
+[tool.poetry.group.dev.dependencies]
+jupyter = "^1.1.1"
+ipykernel = "^6.29.5"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

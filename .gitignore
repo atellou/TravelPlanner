@@ -1,3 +1,4 @@
+checkpoints.sqlite**
 *.env
 *.pyc
 *.ipynb

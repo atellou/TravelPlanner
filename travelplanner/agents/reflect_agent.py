@@ -18,12 +18,9 @@ from pydantic import BaseModel, Field
 from IPython.display import Image
 
 from tools import VectorRetrieverTool
-from prompt import (
+from travelplanner.prompts.react_reflection_agent import (
     QUESTION_PLANNER_INSTRUCTION,
-    # RESEARCHER_PLAN_INSTRUCTION,
     REACT_REFLECT_PLANNER_INSTRUCTION,
-    # REFLECT_INSTRUCTION,
-    # RESEARCH_CRITIQUE_PROMPT,
 )
 
 
@@ -143,7 +140,6 @@ class AgentPlanner:
         return recent_tool_messages[::-1]
 
     def generate_node(self, state: AgentState):
-        state
         tool_messages = self.get_last_tool_messages(state)
         docs_content = "\n\n".join(doc.content for doc in tool_messages)
         message = [
