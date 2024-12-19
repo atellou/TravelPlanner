@@ -76,8 +76,8 @@ class VectorRetrieverTool(BaseTool):
         """Use the tool."""
         logger.warning(f"Searching information for {question}")
         retrieved_docs = self.vector_store.similarity_search(question, k=2)
-        serialized = "\n\n".join(
-            (f"Source: {doc.metadata}\n" f"Content: {doc.page_content}")
+        serialized = [
+            {f"Source: {doc.metadata}", f"Content: {doc.page_content}"}
             for doc in retrieved_docs
-        )
+        ]
         return serialized

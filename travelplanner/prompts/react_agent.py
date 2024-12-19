@@ -35,6 +35,7 @@ Dinner: Kylin Skybar, Charlotte
 Accommodation: -
 ***** Example Ends *****
 
+
 Use the following pieces of retrieved context to answer \
 the question. If you don't know the answer, say that you  \
 don't know. Keep the answer concise.
