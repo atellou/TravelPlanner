@@ -1,57 +1,50 @@
-from typing import TypedDict, List, Annotated, Optional
+from typing import TypedDict, List, Annotated, Optional, Literal
 import sqlite3
-import time
+import logging
+import ast
+
+logger = logging.getLogger(__name__)
 
 from langchain_google_vertexai import ChatVertexAI
 from langchain_core.messages import (
     AnyMessage,
     SystemMessage,
     HumanMessage,
+    AIMessage,
 )
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.graph import StateGraph, END, add_messages
+from langgraph.graph import StateGraph, START, END, add_messages
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.messages import SystemMessage
+from langgraph.types import Command
 
 from pydantic import BaseModel, Field
 from IPython.display import Image
 
 from tools import VectorRetrieverTool
-from travelplanner.prompts.react_reflection_agent import (
-    QUESTION_PLANNER_INSTRUCTION,
-    REACT_REFLECT_PLANNER_INSTRUCTION,
+
+from prompts.react_reflection_agent import (
+    QUESTION_ANSWERING_INSTRUCTION,
+    TASK_DECODER_INSTRUCTION,
+    RESEARCH_INSTRUCTION,
 )
-
-
-class Queries(BaseModel):
-    queries: List[str]
-
-
-class GenerateResponse(BaseModel):
-    plan: Optional[str] = Field(description="The formulated plan.", default="")
-    action: str = Field(description="The message that should be returned to the user.")
-    though: str = Field(
-        description="The though process performed to reach the conclusions."
-    )
-    tools: list = Field(
-        description="The list of tools that should be used to answer the question.",
-        default=[],
-    )
 
 
 class AgentState(TypedDict):
     message: str
-    messages: Annotated[list[AnyMessage], add_messages]
-    queries: List[str]
+    task: str
+    question: List[str]
     plan: str
-    information: str
-    revision_number: int
-    max_revisions: int
+    conversation_history: Annotated[list[AnyMessage], add_messages]
+    messages: List[str]
+    development_concurrent_time: int
+    plan: str
+    information: Annotated[list[AnyMessage], add_messages]
 
 
-class AgentPlanner:
-    def __init__(self, tools: List[BaseTool], model_name="gemini-1.5-flash"):
+class ReflectAgent:
+    def __init__(self, tools: List[BaseTool] = None, model_name="gemini-1.5-flash"):
         self.model_name = model_name
         self.llm = ChatVertexAI(
             model=model_name,
@@ -59,10 +52,6 @@ class AgentPlanner:
             verbose=True,
             max_retries=1,
         )
-        # NOTE: Temporal beahviour, the idea is to be flexible with the tools usage
-        assert any(
-            [isinstance(tool, VectorRetrieverTool) for tool in tools]
-        ), "At least one tool should be a VectorRetrieverTool."
         self.tools = ToolNode(tools)
         self.llm_tools = self.llm.bind_tools(tools)
         self.graph = self.define_graph()
@@ -70,107 +59,147 @@ class AgentPlanner:
     def define_graph(self):
         # Nodes
         builder = StateGraph(AgentState)
-        builder.add_node("generate_queries", self.generate_queries_node)
-        builder.add_node("query_or_respond", self.query_or_respond_node)
+        builder.add_node("question_answer", self.question_answer_node)
+        builder.add_node("task_decoder", self.task_decoder_node)
+        builder.add_node("researcher", self.researcher_node)
         builder.add_node("tools", self.tools)
-        builder.add_node("generate", self.generate_node)
-        # builder.add_node("reflect", self.reflection_node)
-        # Edges Order
-        builder.set_entry_point("generate_queries")
-        builder.add_edge("generate_queries", "query_or_respond")
-        builder.add_conditional_edges(
-            "query_or_respond",
-            tools_condition,
-            {END: END, "tools": "tools"},
-        )
-        # builder.add_edge("tools", "reflect")
-        builder.add_edge("tools", "generate")
-        builder.add_edge("generate", END)
+        builder.add_node("tool_parser", self.tool_parser_node)
+        builder.add_node("the_end", lambda state: {"development_concurrent_time": 0})
 
-        self.conn = sqlite3.connect("checkpoints.sqlite", check_same_thread=False)
+        # Edges Order
+        builder.add_edge(START, "question_answer")
+        builder.add_edge("task_decoder", "researcher")
+        builder.add_conditional_edges(
+            "researcher",
+            tools_condition,
+            {END: "question_answer", "tools": "tools"},
+        )
+        builder.add_edge("tools", "tool_parser")
+        builder.add_edge("tool_parser", END)
+        builder.add_edge("the_end", END)
+
+        # Checkpointer
+        self.conn = sqlite3.connect(
+            "checkpoints_reflect.sqlite", check_same_thread=False
+        )
         self.memory = SqliteSaver(self.conn)
         return builder.compile(checkpointer=self.memory)
 
     def display_graph(self):
-        return Image(self.graph.get_graph().draw_png())
+        return Image(self.graph.get_graph().draw_mermaid_png())
 
-    # First Stage
-    def generate_queries_node(self, state: AgentState):
-        response = self.llm.with_structured_output(Queries).invoke(
-            [
-                SystemMessage(content=QUESTION_PLANNER_INSTRUCTION),
-                HumanMessage(content=state["message"]),
-            ]
+    def question_answer_node(
+        self, state: AgentState
+    ) -> Command[Literal["task_decoder", "the_end"]]:
+        logger.info("Question Answer Node")
+        development_concurrent_time = state.get("development_concurrent_time", 0)
+        message = QUESTION_ANSWERING_INSTRUCTION.format(
+            development_concurrent_time=development_concurrent_time,
+            task=state.get("task", ""),
+            plan=state.get("plan", "Day:1"),
+            suggestion=state.get("messages", ["No suggestions returned yet"])[-1],
         )
-        return {
-            "queries": response.queries,
-        }
-
-    def query_or_respond_node(self, state: AgentState):
-        prompt = (
-            """The following queries about the travel were provided by an expert: {}"""
-        )
-        responses = []
-        for query in state["queries"]:
-            time.sleep(60)
-            print(query)
-            response = self.llm_tools.invoke(
-                [
-                    SystemMessage(content=prompt.format(query)),
-                    HumanMessage(content=state["message"]),
+        conversation_history = state["conversation_history"] or []
+        human_msg = HumanMessage(content=state["message"])
+        message = conversation_history + [
+            SystemMessage(content=message),
+            human_msg,
+        ]
+        msg_ext = []
+        ai_msg_ok = False
+        for __ in range(3):
+            msg_attempt = message.copy() + msg_ext
+            response = self.llm.invoke(msg_attempt)
+            try:
+                py_response = dict(ast.literal_eval(response.content))
+                development = py_response["development"]
+                ai_message = py_response["message"]
+                assert isinstance(development, bool) and isinstance(
+                    ai_message, str
+                ), "The 'development' key should have a True or False value, and the 'message' key should be a valid string value."
+                ai_msg_ok = True
+            except ValueError as e:
+                msg_ext = [
+                    SystemMessage(
+                        content="Wrong formated response.The response returned is {}. Error provided: {}".format(
+                            response.content, e
+                        )
+                    )
                 ]
-            )
-            responses.append(response)
-        print(responses)
+            except KeyError as e:
+                msg_ext = [
+                    SystemMessage(
+                        content="Wrong formated response, {}. The response returned is {}".format(
+                            e, response.content
+                        )
+                    )
+                ]
+            except AssertionError as e:
+                msg_ext = [
+                    SystemMessage(
+                        content="Wrong formated response, {}. The response returned is {}".format(
+                            e, response.content
+                        )
+                    )
+                ]
+
+        assert (
+            ai_msg_ok
+        ), "The AI message was not generated correctly for 'question_answer_node' requirements."
+
+        # Replacement for a conditional edge function
+        if development:
+            goto = "task_decoder"
+            add_to_history = [human_msg]
+        else:
+            goto = "the_end"
+            add_to_history = [human_msg, AIMessage(content=ai_message)]
+
+        return Command(
+            # this is the state update
+            update={
+                "conversation_history": add_to_history,
+                "development_concurrent_time": development_concurrent_time + 1,
+            },
+            # this is a replacement for an edge
+            goto=goto,
+        )
+
+    def task_decoder_node(self, state: AgentState):
+        logger.info("Task Decoder Node")
+        message = TASK_DECODER_INSTRUCTION.format(
+            task=state.get("task", state["message"]),
+            plan=state.get("plan", "Day:1"),
+        )
+        message = state["conversation_history"] + [
+            SystemMessage(content=message),
+        ]
+        response = self.llm.invoke(message)
         return {
-            "messages": responses,
-            "revision_number": state.get("revision_number", 1) + 1,
+            "task": response.content,
         }
 
-    # Second Stage
-    def get_last_tool_messages(self, state: AgentState):
-        """Generate answer."""
-        # Get generated ToolMessages
+    def researcher_node(self, state: AgentState):
+        logger.info("Researcher Node")
+        message = RESEARCH_INSTRUCTION.format(
+            task=state["task"],
+            plan=state.get("plan", "Day:1"),
+        )
+        message = state["conversation_history"] + [
+            SystemMessage(content=message),
+        ]
+        response = self.llm_tools.invoke(message)
+        return {
+            "messages": [response],
+        }
+
+    def tool_parser_node(self, state: AgentState):
+        logger.info("Tool Parser Node")
         recent_tool_messages = []
         for message in reversed(state["messages"]):
             if message.type == "tool":
                 recent_tool_messages.append(message)
             else:
                 break
-        return recent_tool_messages[::-1]
-
-    def generate_node(self, state: AgentState):
-        tool_messages = self.get_last_tool_messages(state)
-        docs_content = "\n\n".join(doc.content for doc in tool_messages)
-        message = [
-            SystemMessage(
-                content=REACT_REFLECT_PLANNER_INSTRUCTION.format(
-                    information=docs_content
-                )
-            ),
-            HumanMessage(content=state["message"]),
-        ]
-        response = self.llm.invoke(message)
-        return {
-            "messages": [response],
-            "plan": response.content,
-            "revision_number": state.get("revision_number", 1) + 1,
-        }
-
-    # Third Stage
-    # def reflection_node(self, state: AgentState):
-    #     tool_messages = self.get_last_tool_messages(state)
-    #     docs_content = "\n\n".join(doc.content for doc in tool_messages)
-    #     message = [
-    #         SystemMessage(
-    #             content=REFLECT_INSTRUCTION.format(
-    #                 information=docs_content
-    #             )
-    #         ),
-    #         HumanMessage(content=state["message"]),
-    #     ]
-    #     response = self.llm.invoke(message)
-    #     return {
-    #         "messages": [response],
-    #         "reflection": response.content,
-    #     }
+        docs_content = "\n\n".join(doc.content for doc in recent_tool_messages[::-1])
+        return {"information": [AnyMessage(content=docs_content)]}
